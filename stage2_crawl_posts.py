@@ -32,11 +32,17 @@ class PostCrawler:
     """第二阶段：使用Playwright爬取帖子详细内容"""
 
     def __init__(self, subreddit_url, headless=False, 
-                 use_system_browser='chrome', delays=None):
+                 use_system_browser='chrome', delays=None,
+                 start_index=None, end_index=None):
 
         self.subreddit_url = subreddit_url
         self.headless = headless
         self.use_system_browser = use_system_browser
+        
+        # 区间爬取参数（0-based索引，包含边界）
+        self.start_index = start_index  # None表示从头开始
+        self.end_index = end_index      # None表示爬到末尾
+        
         self.delays = delays or {
             'page_min': 2000, 'page_max': 5000,
             'action_min': 500, 'action_max': 1500,
@@ -49,14 +55,12 @@ class PostCrawler:
         self.subreddit_dir = f".\\outputs\\{self.subreddit_name}"
         Path(self.subreddit_dir).mkdir(parents=True, exist_ok=True)
         
-        # 结果文件路径
-        self.output_file = os.path.join(self.subreddit_dir, f"{self.subreddit_name}_data.json")
-        
         # URL列表文件（第一阶段生成，第二阶段只读）
         self.urls_file = os.path.join(self.subreddit_dir, f"{self.subreddit_name}_urls.json")
         
-        # 第二阶段爬取进度文件
-        self.progress_file = os.path.join(self.subreddit_dir, f"{self.subreddit_name}_crawl_progress.json")
+        # 结果文件路径和进度文件路径（根据区间动态设置，在load_url_list后确定）
+        self.output_file = None
+        self.progress_file = None
         
         # 浏览器数据目录
         self.user_data_dir = self._get_browser_data_dir()
@@ -69,7 +73,7 @@ class PostCrawler:
         self.collect_source = "pullpush"
         
         # SQLite数据库路径（全局唯一）
-        self.db_path = "./outputs/reddit_posts.db"
+        self.db_path = "./outputs/reddit_posts.sqlite"
         Path("./outputs").mkdir(parents=True, exist_ok=True)
         self._init_database()
         
@@ -83,42 +87,71 @@ class PostCrawler:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                post_id TEXT UNIQUE,
-                subreddit TEXT,
-                collect_source TEXT,
-                url TEXT,
-                title TEXT,
-                body TEXT,
-                author TEXT,
-                created_time TEXT,
-                score INTEGER,
-                upvote_ratio REAL,
-                num_comments INTEGER,
-                num_crossposts INTEGER,
-                num_comments_filtered INTEGER,
-                total_awards_received INTEGER,
-                pinned INTEGER,
-                distinguished TEXT,
-                flair_text TEXT,
-                content_categories TEXT,
-                category TEXT,
-                pwls INTEGER,
-                wls INTEGER,
-                user_reports TEXT,
-                mod_reports TEXT,
-                author_patreon_flair INTEGER,
-                comments TEXT,
-                crawled_at TEXT
-            )
-        ''')
+        # 检查表是否存在
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='posts'")
+        table_exists = cursor.fetchone() is not None
+        
+        if not table_exists:
+            # 创建新表
+            cursor.execute('''
+                CREATE TABLE posts (
+                    index_in_list INTEGER,
+                    post_id TEXT PRIMARY KEY,
+                    subreddit TEXT,
+                    collect_source TEXT,
+                    url TEXT,
+                    title TEXT,
+                    body TEXT,
+                    author TEXT,
+                    created_time TEXT,
+                    score INTEGER,
+                    upvote_ratio REAL,
+                    num_comments INTEGER,
+                    num_crossposts INTEGER,
+                    num_comments_filtered INTEGER,
+                    total_awards_received INTEGER,
+                    pinned INTEGER,
+                    distinguished TEXT,
+                    flair_text TEXT,
+                    content_categories TEXT,
+                    category TEXT,
+                    pwls INTEGER,
+                    wls INTEGER,
+                    user_reports TEXT,
+                    mod_reports TEXT,
+                    author_patreon_flair INTEGER,
+                    comments TEXT,
+                    crawled_at TEXT,
+                    is_valid INTEGER DEFAULT 1
+                )
+            ''')
+            logging.info("创建新的posts表")
+        else:
+            # 检查并添加缺失的列
+            cursor.execute("PRAGMA table_info(posts)")
+            existing_columns = [col[1] for col in cursor.fetchall()]
+            
+            # 添加index_in_list列（如果不存在）
+            if 'index_in_list' not in existing_columns:
+                try:
+                    cursor.execute('ALTER TABLE posts ADD COLUMN index_in_list INTEGER')
+                    logging.info("添加index_in_list列到posts表")
+                except sqlite3.OperationalError as e:
+                    logging.warning(f"添加index_in_list列失败: {e}")
+            
+            # 添加is_valid列（如果不存在）
+            if 'is_valid' not in existing_columns:
+                try:
+                    cursor.execute('ALTER TABLE posts ADD COLUMN is_valid INTEGER DEFAULT 1')
+                    logging.info("添加is_valid列到posts表")
+                except sqlite3.OperationalError as e:
+                    logging.warning(f"添加is_valid列失败: {e}")
         
         # 创建索引以提高查询效率
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_subreddit ON posts(subreddit)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_collect_source ON posts(collect_source)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_post_id ON posts(post_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_index_in_list ON posts(index_in_list)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_valid ON posts(is_valid)')
         
         conn.commit()
         conn.close()
@@ -355,7 +388,7 @@ class PostCrawler:
             raise e
 
     def load_url_list(self):
-        """加载URL列表（第一阶段生成的索引文件，只读）"""
+        """加载URL列表（第一阶段生成的索引文件，只读）并设置区间"""
         if not os.path.exists(self.urls_file):
             logging.error(f"URL索引文件不存在: {self.urls_file}")
             logging.error("请先运行第一阶段收集URL")
@@ -374,37 +407,83 @@ class PostCrawler:
                 logging.error("URL列表为空")
                 return None
             
-            logging.info(f"已加载URL索引: {len(url_list)} 个帖子")
+            total_count = len(url_list)
+            
+            # 设置区间边界（0-based索引）
+            if self.start_index is None:
+                self.start_index = 0
+            if self.end_index is None:
+                self.end_index = total_count - 1
+            
+            # 边界检查
+            if self.start_index < 0:
+                self.start_index = 0
+            if self.end_index >= total_count:
+                self.end_index = total_count - 1
+            if self.start_index > self.end_index:
+                logging.error(f"无效区间: start={self.start_index}, end={self.end_index}")
+                return None
+            
+            # 设置区间相关的文件路径
+            self._setup_range_files()
+            
+            logging.info(f"已加载URL索引: 共 {total_count} 个帖子，本次爬取区间 [{self.start_index}, {self.end_index}]")
             return url_list
             
         except Exception as e:
             logging.error(f"读取URL索引文件失败: {e}")
             return None
+    
+    def _setup_range_files(self):
+        """根据区间设置结果文件和进度文件路径"""
+        range_suffix = f"{self.start_index}_{self.end_index}"
+        self.output_file = os.path.join(
+            self.subreddit_dir, 
+            f"{self.subreddit_name}_data_{range_suffix}.json"
+        )
+        self.progress_file = os.path.join(
+            self.subreddit_dir, 
+            f"{self.subreddit_name}_crawl_progress_{range_suffix}.json"
+        )
 
     def load_crawl_progress(self):
         """加载爬取进度（当前爬到第几个）"""
         if not os.path.exists(self.progress_file):
-            return 1, 0  # 从第1个开始，已爬取0条
+            return self.start_index, 0  # 从区间起点开始
         
         try:
             with open(self.progress_file, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
             
-            current_index = progress.get('current_index', 1)
+            # 验证进度文件的区间是否匹配
+            saved_start = progress.get('range_start')
+            saved_end = progress.get('range_end')
+            if saved_start != self.start_index or saved_end != self.end_index:
+                logging.warning(f"进度文件区间 [{saved_start}, {saved_end}] 与当前区间 [{self.start_index}, {self.end_index}] 不匹配，从区间起点开始")
+                return self.start_index, 0
+            
+            current_index = progress.get('current_index', self.start_index)
             total_crawled = progress.get('total_crawled', 0)
             
-            logging.info(f"恢复爬取进度: 第 {current_index} 个，已爬取 {total_crawled} 条")
-            return current_index, total_crawled
+            # 恢复时从下一个索引开始，避免重复爬取
+            next_index = current_index + 1
+            if next_index > self.end_index:
+                next_index = self.end_index + 1  # 已完成所有爬取
+            
+            logging.info(f"恢复爬取进度: 上次处理到索引 {current_index}，从索引 {next_index} 继续，已爬取 {total_crawled} 条")
+            return next_index, total_crawled
             
         except Exception as e:
-            logging.warning(f"读取进度文件失败: {e}，从头开始")
-            return 1, 0
+            logging.warning(f"读取进度文件失败: {e}，从区间起点开始")
+            return self.start_index, 0
 
     def save_crawl_progress(self, current_index):
         """保存爬取进度"""
         try:
             progress = {
                 "subreddit": self.subreddit_name,
+                "range_start": self.start_index,
+                "range_end": self.end_index,
                 "current_index": current_index,
                 "total_crawled": self.total_crawled_count,
                 "last_updated": datetime.datetime.now().isoformat()
@@ -454,70 +533,94 @@ class PostCrawler:
             logging.error(f"保存数据失败: {e}")
 
     def _save_to_sqlite(self, posts_data):
-        """保存帖子数据到SQLite数据库"""
+        """保存帖子数据到SQLite数据库（重复post_id时覆盖）"""
+        if not posts_data:
+            return
+            
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         crawled_at = datetime.datetime.now().isoformat()
         inserted_count = 0
-        skipped_count = 0
+        updated_count = 0
+        error_count = 0
         
         for post in posts_data:
             try:
+                # 先检查是否存在
+                post_id = post.get("post_id")
+                cursor.execute('SELECT 1 FROM posts WHERE post_id = ?', (post_id,))
+                exists = cursor.fetchone() is not None
+                
+                # 准备数据，确保所有字段都有默认值
+                insert_data = (
+                    post.get("index", 0),  # index_in_list
+                    post_id,  # post_id
+                    post.get("subreddit", self.subreddit_name),  # subreddit
+                    self.collect_source,  # collect_source
+                    post.get("url", ""),  # url
+                    post.get("title", ""),  # title
+                    post.get("body", ""),  # body
+                    post.get("author", ""),  # author
+                    post.get("created_time", ""),  # created_time
+                    post.get("score", 0),  # score
+                    post.get("upvote_ratio", 0.0),  # upvote_ratio
+                    post.get("num_comments", 0),  # num_comments
+                    post.get("num_crossposts", 0),  # num_crossposts
+                    post.get("num_comments_filtered", 0),  # num_comments_filtered
+                    post.get("total_awards_received", 0),  # total_awards_received
+                    1 if post.get("pinned") else 0,  # pinned
+                    post.get("distinguished", ""),  # distinguished
+                    post.get("flair_text", ""),  # flair_text
+                    json.dumps(post.get("content_categories", []), ensure_ascii=False),  # content_categories
+                    post.get("category", ""),  # category
+                    post.get("pwls", -1),  # pwls
+                    post.get("wls", -1),  # wls
+                    json.dumps(post.get("user_reports", []), ensure_ascii=False),  # user_reports
+                    json.dumps(post.get("mod_reports", []), ensure_ascii=False),  # mod_reports
+                    post.get("author_patreon_flair", 0),  # author_patreon_flair
+                    json.dumps(post.get("comments", []), ensure_ascii=False),  # comments
+                    crawled_at,  # crawled_at
+                    1 if post.get("is_valid", True) else 0  # is_valid
+                )
+                
                 cursor.execute('''
-                    INSERT OR IGNORE INTO posts (
-                        post_id, subreddit, collect_source, url, title, body, author,
+                    INSERT OR REPLACE INTO posts (
+                        index_in_list, post_id, subreddit, collect_source, url, title, body, author,
                         created_time, score, upvote_ratio, num_comments, num_crossposts,
                         num_comments_filtered, total_awards_received, pinned, distinguished, flair_text,
                         content_categories, category, pwls, wls, user_reports,
-                        mod_reports, author_patreon_flair, comments, crawled_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    post.get("post_id"),
-                    post.get("subreddit", self.subreddit_name),
-                    self.collect_source,
-                    post.get("url"),
-                    post.get("title"),
-                    post.get("body"),
-                    post.get("author"),
-                    post.get("created_time"),
-                    post.get("score", 0),
-                    post.get("upvote_ratio", 0.0),
-                    post.get("num_comments", 0),
-                    post.get("num_crossposts", 0),
-                    post.get("num_comments_filtered", 0),
-                    post.get("total_awards_received", 0),
-                    1 if post.get("pinned") else 0,
-                    post.get("distinguished"),
-                    post.get("flair_text"),
-                    json.dumps(post.get("content_categories", []), ensure_ascii=False),
-                    post.get("category"),
-                    post.get("pwls", -1),
-                    post.get("wls", -1),
-                    json.dumps(post.get("user_reports", []), ensure_ascii=False),
-                    json.dumps(post.get("mod_reports", []), ensure_ascii=False),
-                    post.get("author_patreon_flair", 0),
-                    json.dumps(post.get("comments", []), ensure_ascii=False),
-                    crawled_at
-                ))
+                        mod_reports, author_patreon_flair, comments, crawled_at, is_valid
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', insert_data)
                 
-                if cursor.rowcount > 0:
-                    inserted_count += 1
+                if exists:
+                    updated_count += 1
                 else:
-                    skipped_count += 1
+                    inserted_count += 1
                     
-            except sqlite3.IntegrityError:
-                skipped_count += 1
             except Exception as e:
-                logging.warning(f"保存帖子到SQLite失败 (post_id={post.get('post_id')}): {e}")
+                error_count += 1
+                logging.error(f"保存帖子到SQLite失败 (post_id={post.get('post_id', 'Unknown')}): {e}")
+                logging.debug(f"失败的帖子数据: {post}")
         
-        conn.commit()
-        conn.close()
+        try:
+            conn.commit()
+        except Exception as e:
+            logging.error(f"SQLite事务提交失败: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
         
-        if skipped_count > 0:
-            logging.info(f"SQLite: 新增 {inserted_count} 条，跳过 {skipped_count} 条重复数据")
+        # 输出统计信息
+        if error_count > 0:
+            logging.warning(f"SQLite: 新增 {inserted_count} 条，更新 {updated_count} 条，失败 {error_count} 条")
+        elif updated_count > 0:
+            logging.info(f"SQLite: 新增 {inserted_count} 条，更新 {updated_count} 条已存在记录")
+        else:
+            logging.info(f"SQLite: 新增 {inserted_count} 条")
 
-    async def fetch_post_json(self, post_url):
+    async def fetch_post_json(self, post_url, url_index):
         """获取单个帖子的JSON数据"""
         try:
             # 构造JSON API URL
@@ -546,12 +649,13 @@ class PostCrawler:
             
             # 提取帖子数据
             post_data = {
+                "index": url_index,
                 "post_id": self._extract_post_id(post_url),
-                "url": post_info.get("url", post_url),
+                "url": post_url,
                 "subreddit": post_info.get("subreddit", ""),
                 "title": post_info.get("title", "N/A"),
                 "body": post_info.get("selftext", ""),
-                "author": post_info.get("author", "[Deleted]"),
+                "author": post_info.get("author", "[deleted]"),
                 "created_time": self._convert_time(post_info.get("created_utc", 0)),
                 "score": post_info.get("score", 0),
                 "upvote_ratio": post_info.get("upvote_ratio", 0.0),
@@ -569,7 +673,8 @@ class PostCrawler:
                 "user_reports": post_info.get("user_reports", []),
                 "mod_reports": post_info.get("mod_reports", []),
                 "author_patreon_flair": post_info.get("author_patreon_flair", 0),
-                "comments": []
+                "comments": [],
+                "is_valid": self._is_post_valid(post_info.get("title", ""))
             }
             
             # 解析评论
@@ -596,15 +701,15 @@ class PostCrawler:
                 count += self._count_comments(comment["replies"])
         return count
 
-    def _is_bot_or_mod_comment(self, author, body):
-        """判断是否为版主/机器人评论"""
+    def _is_bot_or_mod_comment_or_deleted(self, author, body):
+        """判断是否为版主/机器人评论或已删除评论"""
         # 检查评论人是否为 AutoModerator
-        if author == "AutoModerator":
+        if author == "AutoModerator" or author == "[deleted]":
             return True
         
-        # 检查评论内容是否包含机器人/版主特征
+        # 检查评论内容是否包含机器人/版主特征, 或者删除
         body_lower = body.lower() if body else ""
-        if "i am a bot" in body_lower or "moderator" in body_lower:
+        if "i am a bot" in body_lower or "moderator" in body_lower or "[deleted]" in body_lower:
             return True
         
         return False
@@ -617,9 +722,9 @@ class PostCrawler:
         data = comment_data.get('data', {})
         
         # 过滤版主/机器人评论
-        author = data.get("author", "[Deleted]")
+        author = data.get("author", "[deleted]")
         body = data.get("body", "")
-        if self._is_bot_or_mod_comment(author, body):
+        if self._is_bot_or_mod_comment_or_deleted(author, body):
             return None
         
         utc_timestamp = data.get("created_utc", 0)
@@ -658,6 +763,20 @@ class PostCrawler:
         """提取帖子ID"""
         match = re.search(r'/comments/([a-zA-Z0-9]+)/', url)
         return match.group(1) if match else None
+    
+    def _is_post_valid(self, title):
+        """检查帖子是否有效（未被删除或移除）"""
+        if not title:
+            return False
+        
+        title_lower = title.lower()
+        invalid_keywords = ["deleted by", "removed by"]
+        
+        for keyword in invalid_keywords:
+            if keyword in title_lower:
+                return False
+        
+        return True
 
     async def crawl_posts(self):
         """主要爬取流程"""
@@ -673,34 +792,36 @@ class PostCrawler:
             # 加载爬取进度
             current_index, self.total_crawled_count = self.load_crawl_progress()
             
-            # 检查进度是否超出范围
-            total_posts = len(url_list)
-            if current_index > total_posts:
-                logging.info("爬取已完成，如需重新爬取请删除进度文件")
+            # 计算区间内的帖子数量
+            range_count = self.end_index - self.start_index + 1
+            
+            # 检查进度是否超出区间范围
+            if current_index > self.end_index:
+                logging.info(f"区间 [{self.start_index}, {self.end_index}] 爬取已完成，如需重新爬取请删除进度文件")
                 return
             
             # 初始化浏览器
             await self.init_browser()
             
-            logging.info(f"开始爬取 {total_posts} 个帖子，从第 {current_index} 个开始")
+            logging.info(f"开始爬取区间 [{self.start_index}, {self.end_index}] 共 {range_count} 个帖子，从索引 {current_index} 开始")
             
             # 遍历帖子获取详细数据
             consecutive_failures = 0
             
-            for index in range(current_index - 1, total_posts):
+            for index in range(current_index, self.end_index + 1):
                 url_item = url_list[index]
                 url = url_item["url"]
-                current_index = index + 1
+                current_index = index
                 
-                logging.info(f"[{current_index}/{total_posts}] 处理: {url}")
+                logging.info(f"[{current_index}/{self.end_index}] (区间{self.start_index}-{self.end_index}) 处理: {url}")
                                 
                 try:
-                    post_data = await self.fetch_post_json(url)
+                    post_data = await self.fetch_post_json(url, index)
                     
                     if post_data:
                         self.all_posts_data.append(post_data)
                         consecutive_failures = 0
-                        # 每10个帖子保存一次数据，传递当前进度信息
+                        # 每10个帖子保存一次数据，传递当前索引（保存已处理的索引）
                         if len(self.all_posts_data) % 10 == 0:
                             self.save_data(current_index)
                     else:
@@ -722,9 +843,9 @@ class PostCrawler:
                     await self.page.wait_for_timeout(random.randint(self.delays['action_min'], self.delays['action_max']))
             
             # 检查是否正常完成
-            if current_index >= total_posts:
+            if current_index >= self.end_index:
                 completed_normally = True
-                logging.info("所有帖子处理完成")
+                logging.info(f"区间 [{self.start_index}, {self.end_index}] 所有帖子处理完成")
             
         except KeyboardInterrupt:
             logging.info("用户中断，进度已保存")
@@ -738,13 +859,9 @@ class PostCrawler:
             # 显示最终统计
             logging.info(f"爬取结束，本次运行总共爬取了 {self.total_crawled_count} 条帖子")
             
-            # 正常完成时清理进度文件
+            # 完成后保留进度文件，方便查看爬取状态
             if completed_normally:
-                try:
-                    os.remove(self.progress_file)
-                    logging.info("任务完成，已清理爬取进度文件")
-                except:
-                    pass
+                logging.info("任务完成，进度文件已保留")
             
             await self.cleanup()
 
@@ -770,10 +887,18 @@ async def main():
     headless = False
     use_system_browser = 'chrome'  # 'chrome', 'edge', 或 None
     
+    # 区间爬取参数（0-based索引，包含边界）
+    # 设置为None表示不限制，爬取全部
+    # 例如: start_index=0, end_index=99 表示爬取第1到第100个帖子
+    start_index = None  # 起始位置，None表示从第1个开始
+    end_index = None    # 结束位置，None表示爬到最后
+    
     crawler = PostCrawler(
         subreddit_url=target_url,
         headless=headless,
         use_system_browser=use_system_browser,
+        start_index=start_index,
+        end_index=end_index,
         delays={
             'page_min': 3000, 'page_max': 5000,
             'action_min': 3000, 'action_max': 8000,
