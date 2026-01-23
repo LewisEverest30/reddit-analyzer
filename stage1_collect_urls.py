@@ -358,7 +358,7 @@ def main():
         subreddit_url=target_url,
         max_posts=max_posts,
         before_timestamp=int(datetime.datetime(2026, 1, 22).timestamp()),
-        api_delay={'min': 1, 'max': 5},
+        api_delay={'min': 1.5, 'max': 3},
         api_page_size=100
     )
     
