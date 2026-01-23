@@ -30,14 +30,13 @@ def setup_logger(debug=False):
 class URLCollector:
     """第一阶段：收集Reddit帖子URL"""
 
-    def __init__(self, subreddit_url, max_posts=100, before_timestamp=None, api_delay=None):
+    def __init__(self, subreddit_url, max_posts=100, before_timestamp=None, api_delay=None, api_page_size=100):
         self.subreddit_url = subreddit_url
         self.max_posts = max_posts
         self.before_timestamp = before_timestamp or int(time.time())
-        
-        # API调用延迟配置（秒）
         self.api_delay = api_delay or {'min': 2, 'max': 5}
-        
+        self.default_page_size = api_page_size
+
         # 提取subreddit名称并创建目录
         self.subreddit_name = self._extract_subreddit_name(subreddit_url)
         self.subreddit_dir = f".\\outputs\\{self.subreddit_name}"
@@ -228,7 +227,7 @@ class URLCollector:
                     api_url = "https://api.pullpush.io/reddit/search/submission/"
                     params = {
                         "subreddit": subreddit_name,
-                        "size": min(100, self.max_posts - len(collected_urls) + 1),
+                        "size": min(self.default_page_size, self.max_posts - len(collected_urls) + 1),
                         "sort": "desc",
                         "sort_type": "created_utc"
                     }
@@ -359,11 +358,11 @@ def main():
         subreddit_url=target_url,
         max_posts=max_posts,
         before_timestamp=int(datetime.datetime(2026, 1, 22).timestamp()),
-        api_delay={'min': 2, 'max': 5}  # API调用间隔（秒）
+        api_delay={'min': 1, 'max': 5},
+        api_page_size=100
     )
     
     url_list = collector.run()
-    logging.info(f"第一阶段完成！收集到 {len(url_list)} 个URL")
 
 
 if __name__ == "__main__":
