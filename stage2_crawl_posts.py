@@ -241,12 +241,39 @@ class PostCrawler:
             # 也检查页面文本中是否包含验证以及登录相关内容
             if not captcha_found:
                 # 检查页面是否包含正常的Reddit数据结构，如果有就跳过验证检测
-                json_element = await self.page.query_selector("pre")
-                json_string = await json_element.text_content()
-                if "title" in  json_string \
-                    and "author" in json_string \
-                    and "selftext" in json_string:
-                    return
+                try:
+                    json_element = await self.page.query_selector("pre")
+                    if json_element:
+                        json_string = await json_element.text_content()
+                        if json_string and "title" in json_string \
+                            and "author" in json_string \
+                            and "selftext" in json_string:
+                            return
+                    else:
+                        # 页面没有找到pre元素，记录详细信息
+                        current_page_url = self.page.url
+                        try:
+                            page_title = await self.page.title()
+                            page_content = await self.page.content()
+                            page_text = await self.page.locator('body').text_content()
+                            
+                            logging.warning(f"页面缺少JSON结构 - URL: {current_page_url}")
+                            logging.warning(f"页面标题: {page_title}")
+                            logging.warning(f"页面文本长度: {len(page_text) if page_text else 0}")
+                            
+                            # 记录页面HTML的前2000字符
+                            if page_content:
+                                logging.info(f"页面HTML前2000字符: {page_content[:2000]}")
+                            
+                            # 记录页面可见文本的前1000字符
+                            if page_text:
+                                logging.info(f"页面可见文本前1000字符: {page_text[:1000]}")
+                                
+                        except Exception as e:
+                            logging.error(f"记录页面详细信息失败: {e}")
+                except Exception as e:
+                    logging.warning(f"检查JSON结构时出错: {e}")
+                
                 try:
                     page_text = await self.page.locator('body').text_content()
                     if page_text:
@@ -255,6 +282,7 @@ class PostCrawler:
                         for keyword in captcha_keywords:
                             if keyword in page_text_lower:
                                 captcha_found = True
+                                logging.warning(f"在页面文本中发现验证关键词: {keyword}")
                                 break
                 except Exception:
                     pass
@@ -830,16 +858,11 @@ class PostCrawler:
                             logging.error("连续失败过多，停止爬取")
                             break
                     
-                    # 延迟
-                    await self.page.wait_for_timeout(random.randint(self.delays['action_min'], self.delays['action_max']))
-                    
                 except Exception as e:
                     consecutive_failures += 1
                     logging.error(f"处理帖子出错: {e}")
-                    
                     if consecutive_failures >= 3:
                         break
-                    
                     await self.page.wait_for_timeout(random.randint(self.delays['action_min'], self.delays['action_max']))
             
             # 检查是否正常完成
@@ -862,20 +885,6 @@ class PostCrawler:
             # 完成后保留进度文件，方便查看爬取状态
             if completed_normally:
                 logging.info("任务完成，进度文件已保留")
-            
-            await self.cleanup()
-
-    async def cleanup(self):
-        """清理资源"""
-        try:
-            if self.page:
-                await self.page.close()
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-        except Exception:
-            pass
 
 
 async def main():
@@ -903,7 +912,7 @@ async def main():
             'page_min': 3000, 'page_max': 5000,
             'action_min': 3000, 'action_max': 8000,
             'scroll_min': 5000, 'scroll_max': 10000,
-            'api_min': 2000, 'api_max': 4000
+            'api_min': 1000, 'api_max': 2000
         }
     )
     
